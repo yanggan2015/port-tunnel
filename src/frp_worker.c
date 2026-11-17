@@ -28,6 +28,7 @@
 #define TYPE_START_WORK 's'
 #define TYPE_PING 'h'
 #define TYPE_PONG '4'
+#define TYPE_UDP_PACKET 'u'
 
 #define Y_DATA 0
 #define Y_WND 1
@@ -55,6 +56,7 @@ typedef struct {
     int remote_port_min;
     int remote_port_max;
     char proxy_name[64];
+    char proxy_type[8]; /* "tcp" or "udp" */
     int http_port;
     char http_bind[64];
     char base_path[64];
@@ -108,6 +110,35 @@ static void b64_encode(const unsigned char *in, int in_len, char *out, int out_c
         out[o++] = rem > 2 ? T[v & 63] : '=';
     }
     if (o < out_cap) out[o] = 0;
+}
+
+static int b64_decode(const char *in, unsigned char *out, int out_cap) {
+    static const signed char T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+    int val = 0, valb = -8, o = 0;
+    const unsigned char *p;
+    if (!in || !out || out_cap < 0) return -1;
+    for (p = (const unsigned char *)in; *p; p++) {
+        int d;
+        if (*p == '=' || *p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') break;
+        d = T[*p];
+        if (d < 0) return -1;
+        val = (val << 6) | d;
+        valb += 6;
+        if (valb >= 0) {
+            if (o >= out_cap) return -1;
+            out[o++] = (unsigned char)((val >> valb) & 0xff);
+            valb -= 8;
+        }
+    }
+    return o;
 }
 
 static void set_err(const char *s) {
@@ -290,7 +321,11 @@ static int http_get_text(const char *host, int port, const char *path,
     return 0;
 }
 
-/* Parse /api/proxy/tcp JSON into online/offline remotePort sets. */
+static const char *proxy_api_path(void) {
+    return strcmp(g.proxy_type, "udp") == 0 ? "/api/proxy/udp" : "/api/proxy/tcp";
+}
+
+/* Parse /api/proxy/tcp or /api/proxy/udp JSON into online/offline remotePort sets. */
 static void parse_proxy_tcp(const char *json, PortSet *online, PortSet *offline) {
     const char *p = json;
     online->n = 0;
@@ -343,13 +378,13 @@ static int pick_remote_port(const PortSet *online, const PortSet *offline, int *
     for (p = 0; p < online->n; p++) port_set_add(&busy, online->v[p]);
     for (p = 0; p < offline->n; p++) port_set_add(&busy, offline->v[p]);
 
-    /* prefer_remote (e.g. 33890) → last → same-as-local → free → offline reclaim */
-    if (g.prefer_remote > 0 && port_in_range(g.prefer_remote) && !port_set_has(&busy, g.prefer_remote)) {
+    /* prefer 可跨主池（如 3389→33890，主池在 50xxx）；last 同理若仍空闲 */
+    if (g.prefer_remote > 0 && g.prefer_remote <= 65535 && !port_set_has(&busy, g.prefer_remote)) {
         *chosen = g.prefer_remote;
         snprintf(reason, rcap, "prefer %d", *chosen);
         return 0;
     }
-    if (g.last_remote_port > 0 && port_in_range(g.last_remote_port) &&
+    if (g.last_remote_port > 0 && g.last_remote_port <= 65535 &&
         !port_set_has(online, g.last_remote_port)) {
         *chosen = g.last_remote_port;
         snprintf(reason, rcap, "last_remote_port %d", *chosen);
@@ -418,7 +453,7 @@ static int dashboard_pick_port(int *chosen) {
         snprintf(g.pick_reason, sizeof(g.pick_reason), "no port (no dashboard)");
         return -1;
     }
-    if (http_get_text(host, g.dashboard_port, "/api/proxy/tcp",
+    if (http_get_text(host, g.dashboard_port, proxy_api_path(),
                       g.dashboard_user, g.dashboard_password, &body, NULL) != 0) {
         free(body);
         if (g.remote_port > 0) {
@@ -1046,6 +1081,46 @@ typedef struct {
     SOCKET loc;
 } CopyArg;
 
+#define UDP_SESS_MAX 64
+
+typedef struct {
+    int used;
+    char key[64];
+    char r_json[256];
+    SOCKET sock;
+    HANDLE th;
+    volatile LONG dead;
+    Mux *m;
+    YStream *st;
+    CRITICAL_SECTION *wmu;
+} UdpSess;
+
+static int json_get_obj(const char *body, const char *key, char *dst, size_t cap) {
+    char pat[64];
+    const char *p, *start;
+    int depth;
+    if (!body || !key || !dst || !cap) return -1;
+    dst[0] = 0;
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    p = strstr(body, pat);
+    if (!p) return -1;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') p++;
+    if (*p != '{') return -1;
+    start = p;
+    depth = 0;
+    do {
+        if (*p == '{') depth++;
+        else if (*p == '}') { depth--; if (depth == 0) { p++; break; } }
+        else if (!*p) return -1;
+        p++;
+    } while (depth > 0);
+    if ((size_t)(p - start) >= cap) return -1;
+    memcpy(dst, start, (size_t)(p - start));
+    dst[p - start] = 0;
+    return 0;
+}
+
 static DWORD WINAPI stream_to_sock(LPVOID p) {
     CopyArg *c = (CopyArg *)p;
     char buf[8192];
@@ -1056,6 +1131,49 @@ static DWORD WINAPI stream_to_sock(LPVOID p) {
     }
     shutdown(c->loc, SD_SEND);
     return 0;
+}
+
+static DWORD WINAPI udp_sess_reader(LPVOID p) {
+    UdpSess *s = (UdpSess *)p;
+    char buf[8192];
+    char b64[11000];
+    char json[12000];
+    for (;;) {
+        DWORD ms = 30000;
+        int n;
+        if (InterlockedCompareExchange(&s->dead, 0, 0)) break;
+        setsockopt(s->sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+        n = recvfrom(s->sock, buf, (int)sizeof(buf), 0, NULL, NULL);
+        if (n <= 0) break;
+        if (InterlockedCompareExchange(&s->dead, 0, 0)) break;
+        b64_encode((const unsigned char *)buf, n, b64, (int)sizeof(b64));
+        snprintf(json, sizeof(json), "{\"c\":\"%s\",\"r\":%s}", b64, s->r_json);
+        EnterCriticalSection(s->wmu);
+        if (write_msg(s->m, s->st, TYPE_UDP_PACKET, json) != 0) {
+            LeaveCriticalSection(s->wmu);
+            break;
+        }
+        LeaveCriticalSection(s->wmu);
+    }
+    return 0;
+}
+
+static void udp_sess_cleanup(UdpSess *sess, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (!sess[i].used) continue;
+        InterlockedExchange(&sess[i].dead, 1);
+        if (sess[i].sock != INVALID_SOCKET) {
+            closesocket(sess[i].sock);
+            sess[i].sock = INVALID_SOCKET;
+        }
+        if (sess[i].th) {
+            WaitForSingleObject(sess[i].th, 5000);
+            CloseHandle(sess[i].th);
+            sess[i].th = NULL;
+        }
+        sess[i].used = 0;
+    }
 }
 
 static DWORD WINAPI work_thread(LPVOID p) {
@@ -1082,12 +1200,114 @@ static DWORD WINAPI work_thread(LPVOID p) {
     }
     json_get(body, "error", err, sizeof(err));
     free(body);
+    body = NULL;
     if (err[0]) {
         stream_release(m, st);
         free(w);
         InterlockedDecrement(&m->refs);
         return 0;
     }
+
+    if (strcmp(g.proxy_type, "udp") == 0) {
+        UdpSess sess[UDP_SESS_MAX];
+        CRITICAL_SECTION wmu;
+        struct sockaddr_in local_addr;
+        int i;
+        memset(sess, 0, sizeof(sess));
+        for (i = 0; i < UDP_SESS_MAX; i++) sess[i].sock = INVALID_SOCKET;
+        InitializeCriticalSection(&wmu);
+        memset(&local_addr, 0, sizeof(local_addr));
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = htons((u_short)w->local_port);
+        if (inet_pton(AF_INET, w->local_host[0] ? w->local_host : "127.0.0.1", &local_addr.sin_addr) != 1)
+            inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
+        for (;;) {
+            char c_b64[11000], r_obj[256], ip[64], sk[64];
+            unsigned char payload[8192];
+            int plen, port, si, found;
+            UdpSess *s;
+            if (read_msg(m, st, &type, &body) != 0) break;
+            if (type == TYPE_PING) {
+                ts = (int64_t)time(NULL);
+                auth_key(g.token, ts, key);
+                snprintf(json, sizeof(json), "{\"privilege_key\":\"%s\",\"timestamp\":%lld}",
+                         key, (long long)ts);
+                EnterCriticalSection(&wmu);
+                if (write_msg(m, st, TYPE_PONG, json) != 0) {
+                    LeaveCriticalSection(&wmu);
+                    free(body); body = NULL;
+                    break;
+                }
+                LeaveCriticalSection(&wmu);
+            } else if (type == TYPE_UDP_PACKET) {
+                c_b64[0] = 0; r_obj[0] = 0; ip[0] = 0;
+                json_get(body, "c", c_b64, sizeof(c_b64));
+                if (json_get_obj(body, "r", r_obj, sizeof(r_obj)) != 0) {
+                    free(body); body = NULL;
+                    continue;
+                }
+                json_get(r_obj, "IP", ip, sizeof(ip));
+                port = json_get_int(r_obj, "Port", 0);
+                if (!ip[0] || port <= 0) {
+                    free(body); body = NULL;
+                    continue;
+                }
+                plen = b64_decode(c_b64, payload, (int)sizeof(payload));
+                if (plen < 0) {
+                    free(body); body = NULL;
+                    continue;
+                }
+                snprintf(sk, sizeof(sk), "%s:%d", ip, port);
+                found = -1;
+                for (si = 0; si < UDP_SESS_MAX; si++) {
+                    if (sess[si].used && strcmp(sess[si].key, sk) == 0) { found = si; break; }
+                }
+                if (found < 0) {
+                    for (si = 0; si < UDP_SESS_MAX; si++) {
+                        if (!sess[si].used) { found = si; break; }
+                    }
+                    if (found < 0) {
+                        free(body); body = NULL;
+                        continue;
+                    }
+                    s = &sess[found];
+                    memset(s, 0, sizeof(*s));
+                    s->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                    if (s->sock == INVALID_SOCKET) {
+                        free(body); body = NULL;
+                        continue;
+                    }
+                    snprintf(s->key, sizeof(s->key), "%s", sk);
+                    snprintf(s->r_json, sizeof(s->r_json), "%s", r_obj);
+                    s->m = m; s->st = st; s->wmu = &wmu; s->used = 1;
+                    s->th = CreateThread(NULL, 0, udp_sess_reader, s, 0, NULL);
+                    if (!s->th) {
+                        closesocket(s->sock);
+                        s->sock = INVALID_SOCKET;
+                        s->used = 0;
+                        free(body); body = NULL;
+                        continue;
+                    }
+                } else {
+                    s = &sess[found];
+                    snprintf(s->r_json, sizeof(s->r_json), "%s", r_obj);
+                }
+                if (plen > 0)
+                    sendto(s->sock, (const char *)payload, plen, 0,
+                           (struct sockaddr *)&local_addr, (int)sizeof(local_addr));
+            }
+            free(body);
+            body = NULL;
+        }
+        free(body);
+        udp_sess_cleanup(sess, UDP_SESS_MAX);
+        DeleteCriticalSection(&wmu);
+        stream_release(m, st);
+        free(w);
+        InterlockedDecrement(&m->refs);
+        return 0;
+    }
+
     loc = tcp_connect(w->local_host, w->local_port);
     if (loc == INVALID_SOCKET) {
         stream_release(m, st);
@@ -1210,7 +1430,7 @@ static int frp_session(void) {
                     snprintf(host, sizeof(host), "%s",
                              g.dashboard_addr[0] ? g.dashboard_addr : g.server_addr);
                     if (g.dashboard_port > 0 &&
-                        http_get_text(host, g.dashboard_port, "/api/proxy/tcp",
+                        http_get_text(host, g.dashboard_port, proxy_api_path(),
                                       g.dashboard_user, g.dashboard_password, &body2, NULL) == 0) {
                         parse_proxy_tcp(body2, &online, &offline);
                         free(body2);
@@ -1228,8 +1448,8 @@ static int frp_session(void) {
             }
             g.remote_port = chosen;
             snprintf(json, sizeof(json),
-                     "{\"proxy_name\":\"%s\",\"proxy_type\":\"tcp\",\"remote_port\":%d}",
-                     g.proxy_name, g.remote_port);
+                     "{\"proxy_name\":\"%s\",\"proxy_type\":\"%s\",\"remote_port\":%d}",
+                     g.proxy_name, g.proxy_type, g.remote_port);
             free(body); body = NULL;
             if (write_msg(m, ctl, TYPE_NEW_PROXY, json) != 0 ||
                 read_msg(m, ctl, &type, &body) != 0 || type != TYPE_NEW_PROXY_RESP) {
@@ -1252,7 +1472,7 @@ static int frp_session(void) {
                     snprintf(host, sizeof(host), "%s",
                              g.dashboard_addr[0] ? g.dashboard_addr : g.server_addr);
                     if (g.dashboard_port > 0 &&
-                        http_get_text(host, g.dashboard_port, "/api/proxy/tcp",
+                        http_get_text(host, g.dashboard_port, proxy_api_path(),
                                       g.dashboard_user, g.dashboard_password, &body2, NULL) == 0) {
                         parse_proxy_tcp(body2, &online, &offline);
                         free(body2);
@@ -1470,7 +1690,7 @@ static void handle_http(SOCKET c) {
         online.n = offline.n = 0;
         snprintf(host, sizeof(host), "%s", g.dashboard_addr[0] ? g.dashboard_addr : g.server_addr);
         if (g.dashboard_port > 0 &&
-            http_get_text(host, g.dashboard_port, "/api/proxy/tcp",
+            http_get_text(host, g.dashboard_port, proxy_api_path(),
                           g.dashboard_user, g.dashboard_password, &dash, NULL) == 0) {
             parse_proxy_tcp(dash, &online, &offline);
             free(dash);
@@ -1683,6 +1903,7 @@ int worker_main(int argc, char **argv) {
     g.remote_port_max = 33899;
     g.prefer_remote = 33890;
     snprintf(g.proxy_name, sizeof(g.proxy_name), "port-tunnel");
+    snprintf(g.proxy_type, sizeof(g.proxy_type), "tcp");
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--local") == 0 && i + 1 < argc) g.local_port = atoi(argv[++i]);
@@ -1696,6 +1917,13 @@ int worker_main(int argc, char **argv) {
             snprintf(g.status_path, sizeof(g.status_path), "%s", argv[++i]);
         else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             snprintf(g.local_host, sizeof(g.local_host), "%s", argv[++i]);
+        else if (strcmp(argv[i], "--proto") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "udp") == 0)
+                snprintf(g.proxy_type, sizeof(g.proxy_type), "udp");
+            else
+                snprintf(g.proxy_type, sizeof(g.proxy_type), "tcp");
+        }
     }
 
     if (gethostname(hostbuf, sizeof(hostbuf) - 1) != 0) snprintf(hostbuf, sizeof(hostbuf), "pc");
