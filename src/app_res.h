@@ -1,0 +1,4 @@
+#ifndef PORT_TUNNEL_APP_RES_H
+#define PORT_TUNNEL_APP_RES_H
+#define IDI_APPICON 101
+#endif
